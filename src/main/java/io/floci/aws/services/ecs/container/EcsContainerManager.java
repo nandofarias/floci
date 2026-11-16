@@ -130,6 +130,8 @@ public class EcsContainerManager {
      * or before the Unix epoch is that zero value rather than a time a container reached.
      */
     private static final Instant DOCKER_ZERO_TIMESTAMP = Instant.EPOCH;
+    /** The {@code FLUENT_HOST} the ECS agent gives an {@code awsvpc} task, whose containers share one namespace. */
+    private static final String FLUENT_AWSVPC_HOST = "127.0.0.1";
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -379,8 +381,19 @@ public class EcsContainerManager {
         String networkModeName = taskDef.getNetworkMode() != null
                 ? taskDef.getNetworkMode().name()
                 : NetworkMode.bridge.name();
+        SecurityGroupFirewallManager.Namespace sharedNamespace = null;
+        SecurityGroupFirewallManager.Namespace namespace = protectedNetwork == null ? null : protectedNetwork.namespace();
+        // The ENI a namespace helper is built around, which is how teardown finds the helper again.
+        String namespaceEniId = protectedNetwork == null ? null : protectedNetwork.eni().getNetworkInterfaceId();
 
         try {
+            if (protectedNetwork == null) {
+                sharedNamespace = prepareSharedNetwork(task, taskDef, region, taskId, taskRoleEndpoint);
+                if (sharedNamespace != null) {
+                    namespace = sharedNamespace;
+                    namespaceEniId = task.getNetworkInterfaceId();
+                }
+            }
             for (ContainerDefinition def : launchOrder) {
                 awaitDependencies(def, containerIds);
                 String containerName = ContainerStorageHelper.dockerName(config, "ecs-" + taskId + "-" + def.getName());
@@ -416,14 +429,17 @@ public class EcsContainerManager {
                         .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                                 "ecs", taskId, regionResolver.getAccountId(), region))
                         .withLabels(ownerLabels());
+                if (namespace != null) {
+                    specBuilder.withNetworkMode("container:" + namespace.helperId());
+                }
                 if (protectedNetwork != null) {
-                    specBuilder.withNetworkMode("container:" + protectedNetwork.namespace().helperId());
                     specBuilder.withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true"));
                 }
                 // Its own address in the credential endpoint's range, so this container has a
                 // connected route to 169.254.170.2 at all. One per container, not per task: each
-                // has its own network namespace and so its own routing table.
-                if (taskRoleEndpoint.vending()) {
+                // has its own network namespace and so its own routing table. A task sharing one
+                // namespace has one address, which its helper holds.
+                if (taskRoleEndpoint.vending() && namespace == null) {
                     specBuilder.withLinkLocalIp(
                             linkLocalAddresses.allocate(taskRoleEndpoint.network(), task.getTaskArn()));
                 }
@@ -478,7 +494,7 @@ public class EcsContainerManager {
 
                 // Stable publishing serves existing host clients; dynamic publishing lets
                 // tasks sharing an awsvpc container port coexist on the Docker host.
-                if (protectedNetwork == null && def.getPortMappings() != null) {
+                if (namespace == null && def.getPortMappings() != null) {
                     boolean awsvpc = taskDef.getNetworkMode() == NetworkMode.awsvpc;
                     boolean publishAwsvpcPorts = awsvpc && config.services().ecs().publishAwsvpcPortsToHost();
                     boolean publishToHost = !containerDetector.isRunningInContainer()
@@ -577,7 +593,9 @@ public class EcsContainerManager {
                         lifecycleManager.removeIfExists(dockerId);
                         throw e;
                     }
-                    fluentHost = inspectContainerIp(dockerId);
+                    // The ECS agent's FLUENT_HOST for awsvpc, where every container shares the task's
+                    // namespace; a router joined to a helper has no address of its own to inspect.
+                    fluentHost = namespace != null ? FLUENT_AWSVPC_HOST : inspectContainerIp(dockerId);
                 } else {
                     ContainerInfo info = lifecycleManager.createAndStartEphemeral(spec, platform);
                     dockerId = info.containerId();
@@ -589,7 +607,7 @@ public class EcsContainerManager {
 
                 // Resolve network bindings for ECS-specific model
                 List<NetworkBinding> networkBindings = resolveNetworkBindings(
-                        protectedNetwork == null ? dockerId : protectedNetwork.namespace().helperId(), def);
+                        namespace == null ? dockerId : namespace.helperId(), def);
 
                 // Build ECS container model
                 Container container = buildContainer(task.getTaskArn(), def, dockerId, networkBindings, region,
@@ -616,9 +634,7 @@ public class EcsContainerManager {
             }
         } catch (Exception e) {
             EcsTaskHandle partial = new EcsTaskHandle(task.getTaskArn(), containerIds, logStreamsByContainerId,
-                    firelensVolumeName,
-                    protectedNetwork == null ? null : protectedNetwork.eni().getNetworkInterfaceId(), region,
-                    stopTimeouts, taskVolumeNames);
+                    firelensVolumeName, namespaceEniId, region, stopTimeouts, taskVolumeNames);
             cleanupStoppedTask(partial);
             if (protectedNetwork != null) {
                 releaseTaskNetwork(task, region);
@@ -629,7 +645,8 @@ public class EcsContainerManager {
             throw e;
         }
         if (task.getNetworkInterfaceId() != null && protectedNetwork == null) {
-            joinTaskVpcNetwork(task, taskDef, containerIds, region);
+            joinTaskVpcNetwork(task, taskDef, containerIds,
+                    sharedNamespace == null ? null : sharedNamespace.helperId(), region);
         }
 
         Map<String, Container> runtimeContainersByName = new LinkedHashMap<>();
@@ -658,9 +675,7 @@ public class EcsContainerManager {
         task.setContainers(containersInDefinitionOrder);
 
         return new EcsTaskHandle(task.getTaskArn(), containerIds, logStreamsByContainerId,
-                firelensVolumeName,
-                protectedNetwork == null ? null : protectedNetwork.eni().getNetworkInterfaceId(), region,
-                stopTimeouts, taskVolumeNames);
+                firelensVolumeName, namespaceEniId, region, stopTimeouts, taskVolumeNames);
     }
 
     private String taskVolumeName(EcsTask task, Volume volume) {
@@ -1156,27 +1171,32 @@ public class EcsContainerManager {
     }
 
     /**
-     * Puts one container of an awsvpc task on its VPC's Docker network at the task ENI address, so
-     * the address DescribeTasks reports answers. AWS gives the whole task that one address; here it
-     * goes to the first container that maps a port, else to the first container. Without
-     * Docker-backed VPC networks, or for an ENI address outside the subnet's planned range, the
-     * containers keep only the network they were created on. Removing the container disconnects
-     * it, before {@link #releaseTaskNetwork} returns the address.
+     * Puts the task ENI address on an awsvpc task's VPC Docker network, so the address DescribeTasks
+     * reports answers. AWS gives the whole task that one address. A task sharing one namespace gives
+     * it to the helper holding that namespace, so every container answers at it; otherwise it goes to
+     * the first container that maps a port, else to the first container. Without Docker-backed VPC
+     * networks, or for an ENI address outside the subnet's planned range, the containers keep only
+     * the network they were created on. Removing the holder disconnects it, before
+     * {@link #releaseTaskNetwork} returns the address.
      */
     private void joinTaskVpcNetwork(EcsTask task, TaskDefinition taskDef, Map<String, String> containerIds,
-                                    String region) {
+                                    String namespaceHelperId, String region) {
         String vpcId = taskVpcId(task, region);
         if (vpcId == null) {
             return;
         }
-        List<ContainerDefinition> definitions = taskDef.getContainerDefinitions();
-        ContainerDefinition holder = definitions.stream()
-                .filter(def -> def.getPortMappings() != null && !def.getPortMappings().isEmpty())
-                .findFirst()
-                .orElse(definitions.getFirst());
+        String holderId = namespaceHelperId;
+        if (holderId == null) {
+            List<ContainerDefinition> definitions = taskDef.getContainerDefinitions();
+            ContainerDefinition holder = definitions.stream()
+                    .filter(def -> def.getPortMappings() != null && !def.getPortMappings().isEmpty())
+                    .findFirst()
+                    .orElse(definitions.getFirst());
+            holderId = containerIds.get(holder.getName());
+        }
         ec2Service.attachContainerToVpc(AwsArnUtils.accountOrDefault(task.getTaskArn(), regionResolver.getAccountId()),
                 region, vpcId, task.getNetworkConfiguration().getAwsvpcConfiguration().getSubnets().getFirst(),
-                containerIds.get(holder.getName()), task.getPrivateIpAddress());
+                holderId, task.getPrivateIpAddress());
     }
 
     /**
@@ -1391,6 +1411,52 @@ public class EcsContainerManager {
         return address == null || address.isBlank() ? "127.0.0.1" : address;
     }
 
+    /**
+     * Whether an awsvpc task's containers share one namespace without security-group enforcement,
+     * which gives a task its own protected one instead.
+     */
+    private boolean sharesTaskNetwork() {
+        return config.services().ecs().sharedTaskNetwork() && firewallManager != null && !firewallManager.enabled();
+    }
+
+    /**
+     * Starts the helper holding an awsvpc task's one network namespace, or returns null when the task
+     * does not share one. The helper holds what the task has once rather than per container, as the
+     * ECS agent's pause container does: the published ports and the link-local address the credential
+     * endpoint is reached from. Built around the task's ENI, as a protected namespace is, so a task
+     * without one keeps a namespace per container.
+     */
+    private SecurityGroupFirewallManager.Namespace prepareSharedNetwork(EcsTask task, TaskDefinition definition,
+                                                                        String region, String taskId,
+                                                                        TaskRoleCredentialEndpoint taskRoleEndpoint) {
+        if (definition.getNetworkMode() != NetworkMode.awsvpc || task.getNetworkInterfaceId() == null
+                || !sharesTaskNetwork()) {
+            return null;
+        }
+        Map<Integer, Integer> bindings = namespacePortBindings(
+                definition,
+                containerDetector.isRunningInContainer(),
+                config.services().ecs().publishAwsvpcPortsToHost(),
+                config.services().ecs().dynamicAwsvpcHostPorts());
+        List<String> linkLocalIps = taskRoleEndpoint.vending()
+                ? List.of(linkLocalAddresses.allocate(taskRoleEndpoint.network(), task.getTaskArn()))
+                : List.of();
+        return firewallManager.createSharedNamespace("ecs", taskId, regionResolver.getAccountId(), region,
+                config.services().ecs().dockerNetwork(), bindings, Map.of(RUN_LABEL, runId), hostPortBindAddress(),
+                linkLocalIps);
+    }
+
+    /**
+     * Removes the helper of a task sharing one namespace, once its containers are gone. Throws when
+     * Docker keeps it, as the protected helper's removal does: the helper still holds the task's host
+     * ports and link-local address, which must not be handed on while it does.
+     */
+    private void removeSharedNetwork(EcsTaskHandle handle) {
+        if (handle.getNetworkInterfaceId() != null && sharesTaskNetwork()) {
+            firewallManager.removeSharedNamespaceStrict(extractTaskId(handle.getTaskArn()));
+        }
+    }
+
     static Map<Integer, Integer> namespacePortBindings(
             TaskDefinition definition, boolean runningInContainer, boolean publishAwsvpcPortsToHost,
             boolean dynamicAwsvpcHostPorts) {
@@ -1453,6 +1519,14 @@ public class EcsContainerManager {
         revokeTaskRoleCredentials(handle.getTaskArn());
         if (allRemoved) {
             removeTaskVolumes(handle);
+            try {
+                removeSharedNetwork(handle);
+            } catch (RuntimeException e) {
+                // Its address stays reserved, the cheaper mistake; see releaseTaskLinkLocalAddresses.
+                LOG.warnv("Could not remove the network namespace helper of ECS task {0}: {1}",
+                        handle.getTaskArn(), e.getMessage());
+                return;
+            }
             releaseTaskLinkLocalAddresses(handle.getTaskArn());
         }
     }
@@ -1547,6 +1621,7 @@ public class EcsContainerManager {
                 if (firewallManager != null && handle.getNetworkInterfaceId() != null) {
                     firewallManager.removeNamespaceStrict(handle.getNetworkInterfaceId());
                 }
+                removeSharedNetwork(handle);
                 cleanupProtectedNetwork(handle);
                 removeTaskVolumes(handle);
                 // Only now: a container that survived a failed removal still holds its address.
@@ -1989,7 +2064,8 @@ public class EcsContainerManager {
 
     /**
      * What a task's containers need to reach the credential endpoint: the relative URI to publish
-     * to them, and the network to give each of them an address on. Both are set or neither is,
+     * to them, and the network to give each of them, or the helper of a task sharing one namespace,
+     * an address on. Both are set or neither is,
      * which {@link #vending()} answers. Absence is a null rather than an {@code Optional} field,
      * which this codebase does not use.
      */
