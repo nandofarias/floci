@@ -2343,59 +2343,6 @@ public class KmsService implements ResourceProvider {
         }
     }
 
-    /**
-     * The stored ARN of the key {@code keyIdOrArn} names in {@code accountId}'s {@code region}, whoever is calling: a
-     * key id or an alias name resolved in that account, or a key or alias ARN read in the account and Region it names.
-     * The enforcement filter reads this for a key another service's resource records, which may be another account's
-     * (a shared snapshot's). A reserved {@code alias/aws/<service>} of the caller's account names AWS's managed key
-     * of that service, which every account has whether anything read it before or not. Empty when that account holds
-     * no such key.
-     */
-    public Optional<String> findKeyArnOfAccount(String keyIdOrArn, String accountId, String region) {
-        if (keyIdOrArn == null || keyIdOrArn.isBlank() || accountId == null || region == null) {
-            return Optional.empty();
-        }
-        String account = accountId;
-        String inRegion = region;
-        String id = keyIdOrArn;
-        if (AwsArnUtils.isArnFor(keyIdOrArn, "kms")) {
-            AwsArnUtils.Arn arn = AwsArnUtils.parse(keyIdOrArn);
-            account = arn.accountId();
-            inRegion = arn.region();
-            id = arn.resource();
-        }
-        if (id.startsWith("alias/")) {
-            if (AwsManagedKeys.isReservedAlias(id) && account.equals(regionResolver.getAccountId())) {
-                // AWS's own key under alias/aws/<service> is in every account, read or not, as listKeys finds it.
-                ensureAwsManagedKeys(inRegion);
-            }
-            Optional<String> target = ofAccount(aliasStore, account, inRegion + "::" + id).map(KmsAlias::getTargetKeyId);
-            if (target.isEmpty()) {
-                return Optional.empty();
-            }
-            id = target.get();
-        } else if (id.startsWith("key/")) {
-            id = id.substring("key/".length());
-        }
-        return ofAccount(keyStore, account, inRegion + "::" + id).map(KmsKey::getArn).filter(arn -> !arn.isBlank());
-    }
-
-    /**
-     * Whether the key {@code keyArn} names, read in the account and Region of the ARN, is one AWS manages, whose key
-     * policy AWS writes to let every principal of the account use it through the service it belongs to.
-     */
-    public boolean isAwsManagedKey(String keyArn) {
-        return keyAt(keyArn).map(key -> AWS_KEY_MANAGER.equals(key.getKeyManager())).orElse(false);
-    }
-
-    /**
-     * Whether the key {@code keyArn} names, read in the account and Region of the ARN, is one KMS uses for a
-     * cryptographic request: enabled, neither disabled nor pending deletion, which KMS refuses one with.
-     */
-    public boolean isEnabledKey(String keyArn) {
-        return keyAt(keyArn).map(key -> "Enabled".equals(key.getKeyState())).orElse(false);
-    }
-
     /** The key a key ARN names, read in the account and Region of the ARN, whoever is calling. */
     private Optional<KmsKey> keyAt(String keyArn) {
         if (!AwsArnUtils.isArnFor(keyArn, "kms")) {
